@@ -11,7 +11,7 @@ from Bot.plugins.database.mongo_db import (
     check_audio_type_mdb,
     get_user_field,
 )
-from Bot.utils.ffmpeg import validate_input_file, get_ffmpeg_caps
+from Bot.utils.ffmpeg import validate_input_file, get_ffmpeg_caps, _ffmpeg_bin, _ffprobe_bin
 
 # Resolution to FFmpeg scale map
 RESOLUTION_MAP = {
@@ -61,7 +61,7 @@ def _has_audio_stream(input_path: str) -> bool:
     """Check if input file has an audio stream."""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "a",
+            [_ffprobe_bin(), "-v", "error", "-select_streams", "a",
              "-show_entries", "stream=codec_type", "-of", "csv=p=0", input_path],
             capture_output=True, text=True, timeout=30,
         )
@@ -74,7 +74,7 @@ def _nvenc_usable() -> bool:
     """Best-effort real usability check for NVENC, not just 'is it listed'."""
     try:
         result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
+            [_ffmpeg_bin(), "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=10,
         )
         if "h264_nvenc" not in result.stdout:
@@ -97,7 +97,7 @@ def _vaapi_usable() -> bool:
     """Best-effort real usability check for VAAPI."""
     try:
         result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
+            [_ffmpeg_bin(), "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=10,
         )
         if "h264_vaapi" not in result.stdout:
@@ -153,14 +153,19 @@ def _get_stream_info(input_path: str):
     (each a list of {"index", "codec", "lang", "title"}), and "ok" (whether
     ffprobe ran successfully at all -- distinct from "found zero streams").
     """
-    info = {"video_streams": [], "audio_streams": [], "subtitle_streams": [], "ok": False}
+    info = {
+        "video_streams": [], "audio_streams": [], "subtitle_streams": [], "ok": False,
+        "returncode": None, "stderr": "",
+    }
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
+            [_ffprobe_bin(), "-v", "error", "-show_entries",
              "stream=index,codec_type,codec_name:stream_tags=language,title",
              "-of", "json", input_path],
             capture_output=True, text=True, timeout=30,
         )
+        info["returncode"] = result.returncode
+        info["stderr"] = result.stderr
         data = json.loads(result.stdout or "{}")
         info["ok"] = True
         for stream in data.get("streams", []):
@@ -195,6 +200,7 @@ def _get_stream_info(input_path: str):
             elif codec_type == "subtitle":
                 info["subtitle_streams"].append(entry)
     except Exception as e:
+        info["stderr"] = str(e)
         LOG.warning(f"Failed to get stream info: {e}")
     return info
 
@@ -245,11 +251,30 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
     # ── 2. Probe actual streams (never assume based on file extension) ──
     streams = _get_stream_info(input_path)
     if not streams["ok"]:
+        LOG.error(
+            f"[encode:{user_id}] FFprobe failed\n"
+            f"Input: {input_path}\n"
+            f"Return code: {streams.get('returncode')}\n"
+            f"stderr: {streams.get('stderr', '')[-1500:]}"
+        )
         raise FFmpegBuildError(
             "ffprobe could not read this file -- it may be corrupted, "
             "incomplete, or not a media file at all."
         )
     if not streams["video_streams"]:
+        try:
+            size = os.path.getsize(input_path)
+        except OSError:
+            size = -1
+        LOG.error(
+            f"[encode:{user_id}] Stream detection failed -- no video stream\n"
+            f"Input: {input_path}\n"
+            f"Size: {size} bytes\n"
+            f"Video streams: {len(streams['video_streams'])}\n"
+            f"Audio streams: {len(streams['audio_streams'])}\n"
+            f"Subtitle streams: {len(streams['subtitle_streams'])}\n"
+            f"ffprobe stderr: {streams.get('stderr', '')[-1500:]}"
+        )
         raise FFmpegBuildError("No video stream was found in this file.")
 
     resolution_key = await check_resolution_settings(user_id) or "480p"
@@ -424,7 +449,7 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
         video_map_args = ["-map", "0:v"]
 
     # ── 10. Assemble the full argument list ──
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    cmd = [_ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y"]
     cmd += hw_input_args
     cmd += trim_args
     cmd += ["-progress", progress_file]

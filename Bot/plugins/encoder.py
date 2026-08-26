@@ -1,6 +1,8 @@
 import time
 import os
 import re
+import uuid
+import shutil
 import asyncio
 from collections import deque
 from datetime import datetime, timezone
@@ -23,7 +25,7 @@ from Bot.utils.decorators import build_ffmpeg_cmd, FFmpegBuildError
 from Bot.utils.ffmpeg import (
     ffmpeg_progress, humanbytes, get_video_duration,
     validate_input_file, validate_output_file,
-    _pil_add_watermark,
+    probe_file_diagnostics, _pil_add_watermark, _ffmpeg_bin,
 )
 from Bot.utils.progress_pyro import progress_callback
 
@@ -153,19 +155,48 @@ async def _encode_video(event, trim_start: str = "", trim_end: str = ""):
     output_path = None
     thumb_path = None
 
+    # ── Unique per-task download directory ──────────────────────────────
+    # Every task gets its own directory instead of a shared "downloads/"
+    # folder. With a shared folder, two concurrent tasks downloading files
+    # that happen to share an original filename (very common -- e.g.
+    # "video.mkv", or the same file forwarded twice) would race to write
+    # the same path: one task's still-downloading/partial file could be
+    # read by another task, or a finished file could be silently
+    # overwritten mid-encode. That collision produces exactly this
+    # symptom -- a file that ffprobe can open but that has no video
+    # stream, because it isn't actually the file the task thinks it is.
+    task_dir = os.path.join("downloads", f"{user_id}_{int(encode_start * 1000)}_{uuid.uuid4().hex[:8]}")
+    try:
+        os.makedirs(task_dir, exist_ok=True)
+    except Exception as e:
+        LOG.error(f"[encode:{user_id}] Could not create task directory {task_dir}: {e}")
+
     status_msg = await event.reply("**Downloading...**")
 
     try:
         # Download
         filepath = await bot.download_media(
             event.message,
-            file="downloads/",
+            file=task_dir + os.sep,
             progress_callback=lambda c, t: progress_callback(c, t, event, status_msg, encode_start, "**Downloading...**"),
         )
 
         if not filepath:
             await status_msg.edit("**Download failed.**")
             return
+
+        # ── Log exactly what Telethon says it downloaded, before trusting
+        #    it. `client.download_media(...)` returns the actual path it
+        #    wrote to -- use that, not an assumed filename -- and confirm
+        #    on disk that it matches reality. ──
+        input_exists = os.path.exists(filepath)
+        input_size = os.path.getsize(filepath) if input_exists else 0
+        LOG.info(
+            f"[encode:{user_id}] Download completed\n"
+            f"Input path: {filepath}\n"
+            f"Input exists: {input_exists}\n"
+            f"Input size: {input_size} bytes ({input_size / (1024 * 1024):.2f} MB)"
+        )
 
         # Confirm the download actually completed -- never hand a partial or
         # empty file to FFmpeg (this was previously unchecked and is one of
@@ -175,6 +206,46 @@ async def _encode_video(event, trim_start: str = "", trim_end: str = ""):
             LOG.error(f"Downloaded file failed validation for user {user_id}: {reason}")
             await status_msg.edit(f"**Download incomplete or invalid.**\n`{reason}`")
             return
+
+        # ── Diagnostic-grade probe of the downloaded file, logged BEFORE
+        #    any FFmpeg command is built, so a "no video stream" failure is
+        #    immediately explainable from the log alone: is this actually a
+        #    video file, is it audio-only, did the download truncate mid
+        #    stream, etc. This is deliberately independent of the lighter
+        #    probe build_ffmpeg_cmd() runs internally. ──
+        diag = probe_file_diagnostics(filepath)
+        if not diag["ran"] or diag["returncode"] != 0:
+            LOG.error(
+                f"[encode:{user_id}] FFprobe failed\n"
+                f"Return code: {diag['returncode']}\n"
+                f"stderr: {diag['stderr'][-1500:]}"
+            )
+        else:
+            LOG.info(
+                f"[encode:{user_id}] FFprobe stream check\n"
+                f"FFprobe format: {diag['format_name']} (duration: {diag['duration']})\n"
+                f"Video streams: {diag['video_streams']}\n"
+                f"Audio streams: {diag['audio_streams']}\n"
+                f"Subtitle streams: {diag['subtitle_streams']}"
+            )
+            if diag["video_streams"] == 0:
+                # No point building an FFmpeg command or spending time on it --
+                # surface the real cause now, with everything needed to
+                # diagnose it, and never touch FFmpeg or the uploader.
+                LOG.error(
+                    f"[encode:{user_id}] Downloaded file has no video stream. "
+                    f"This means Telethon's download itself did not produce a "
+                    f"valid video (wrong/incomplete download, wrong message, "
+                    f"or an audio/document file), not that FFmpeg is broken.\n"
+                    f"ffprobe raw stdout: {diag['stdout'][-1500:]}"
+                )
+                await status_msg.edit(
+                    "**Encoding failed.**\n"
+                    "The downloaded file has no video stream — it may be an "
+                    "audio/document file, or the download was incomplete or "
+                    "corrupted. Please resend the file."
+                )
+                return
 
         # Build FFmpeg command (with trim support). This probes the real
         # streams in the file and validates settings/hw-accel up front, so
@@ -298,7 +369,7 @@ async def _encode_video(event, trim_start: str = "", trim_end: str = ""):
         thumb_path = filepath.rsplit(".", 1)[0] + "_thumb.jpg"
         try:
             thumb_proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-loglevel", "error",
+                _ffmpeg_bin(), "-y", "-loglevel", "error",
                 "-i", output_path,
                 "-ss", "00:00:01", "-vframes", "1", "-q:v", "2",
                 thumb_path,
@@ -393,6 +464,13 @@ async def _encode_video(event, trim_start: str = "", trim_end: str = ""):
                     os.remove(f)
                 except Exception:
                     pass
+        # Clean up this task's unique download directory (never the shared
+        # "downloads/" root -- each task only ever owns its own subfolder).
+        try:
+            if os.path.isdir(task_dir):
+                shutil.rmtree(task_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 async def _check_and_enqueue(event, trim_start: str = "", trim_end: str = ""):

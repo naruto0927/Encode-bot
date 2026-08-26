@@ -2,6 +2,8 @@ import time
 import math
 import os
 import re
+import json
+import shutil
 import asyncio
 import subprocess
 
@@ -13,13 +15,36 @@ from Bot import LOG
 _STDERR_TAIL_LIMIT = 4000  # characters
 
 # ── Capability cache (populated at startup by check_ffmpeg_capabilities) ──────
+# ffmpeg_path / ffprobe_path are resolved ONCE via shutil.which() (which walks
+# PATH exactly like a shell would) and then reused everywhere in this module
+# instead of relying on the bare "ffmpeg"/"ffprobe" name being resolvable
+# again on every subprocess call. This matters on Heroku: the apt buildpack
+# installs to /app/.apt/usr/bin and wires it into PATH via a profile.d script,
+# but that only takes effect for login-shell-style process spawns -- resolving
+# once at startup and caching the absolute path sidesteps any doubt about
+# whether a given subprocess launch method inherits that PATH correctly.
 _CAPS = {
     "ffmpeg": False,
     "ffprobe": False,
+    "ffmpeg_path": None,
+    "ffprobe_path": None,
+    "ffmpeg_version": None,
     "libx264": False,
     "drawtext": False,
     "pil_watermark": False,   # True when Pillow is available as drawtext fallback
 }
+
+
+def _ffmpeg_bin() -> str:
+    """Return the resolved absolute path to ffmpeg, falling back to the bare
+    name (so a call still *attempts* to run and fails with a clear error
+    instead of silently no-op'ing) if resolution hasn't happened yet."""
+    return _CAPS.get("ffmpeg_path") or "ffmpeg"
+
+
+def _ffprobe_bin() -> str:
+    """Same as _ffmpeg_bin() but for ffprobe."""
+    return _CAPS.get("ffprobe_path") or "ffprobe"
 
 
 def time_formatter(milliseconds: int) -> str:
@@ -85,36 +110,92 @@ def check_ffmpeg_capabilities() -> dict:
     """
     global _CAPS
 
-    # ── ffmpeg binary ──
-    try:
-        r = subprocess.run(["ffmpeg", "-version"],
-                           capture_output=True, text=True, timeout=15)
-        _CAPS["ffmpeg"] = (r.returncode == 0)
-    except Exception:
+    # ── Resolve actual executable paths first. Never assume "ffmpeg" on
+    #    PATH is missing just because a prior check looked wrong -- ask the
+    #    OS directly via shutil.which(), exactly like the shell would when
+    #    resolving `which ffmpeg`. ──
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    _CAPS["ffmpeg_path"] = ffmpeg_path
+    _CAPS["ffprobe_path"] = ffprobe_path
+
+    LOG.info(f"FFmpeg path: {ffmpeg_path or 'NOT FOUND on PATH'}")
+    LOG.info(f"FFprobe path: {ffprobe_path or 'NOT FOUND on PATH'}")
+
+    # Common Heroku apt-buildpack location, kept only as a last-resort
+    # fallback and logged loudly if used -- we do NOT silently prefer this
+    # over whatever PATH already resolves, per "do not hard-code an
+    # incorrect path if PATH already exposes the executable".
+    if not ffmpeg_path:
+        fallback = "/app/.apt/usr/bin/ffmpeg"
+        if os.path.exists(fallback) and os.access(fallback, os.X_OK):
+            LOG.warning(f"ffmpeg not found via PATH lookup; falling back to {fallback}")
+            ffmpeg_path = fallback
+            _CAPS["ffmpeg_path"] = ffmpeg_path
+    if not ffprobe_path:
+        fallback = "/app/.apt/usr/bin/ffprobe"
+        if os.path.exists(fallback) and os.access(fallback, os.X_OK):
+            LOG.warning(f"ffprobe not found via PATH lookup; falling back to {fallback}")
+            ffprobe_path = fallback
+            _CAPS["ffprobe_path"] = ffprobe_path
+
+    # ── ffmpeg binary: actually invoke it, don't just trust that the path
+    #    resolved -- a `which` hit can still fail to execute (bad interpreter,
+    #    missing shared libs, wrong architecture, etc.), and that distinction
+    #    matters for diagnosing "which succeeds but -version exits non-zero". ──
+    if ffmpeg_path:
+        try:
+            r = subprocess.run([ffmpeg_path, "-version"],
+                               capture_output=True, text=True, timeout=15)
+            _CAPS["ffmpeg"] = (r.returncode == 0)
+            if r.returncode == 0:
+                first_line = (r.stdout.splitlines() or [""])[0].strip()
+                _CAPS["ffmpeg_version"] = first_line
+            else:
+                LOG.error(
+                    f"FFmpeg version check failed with return code {r.returncode}.\n"
+                    f"stdout: {r.stdout.strip()[-1000:]}\n"
+                    f"stderr: {r.stderr.strip()[-1000:]}"
+                )
+        except Exception as e:
+            LOG.error(f"FFmpeg version check raised an exception: {e}")
+            _CAPS["ffmpeg"] = False
+    else:
         _CAPS["ffmpeg"] = False
 
     if _CAPS["ffmpeg"]:
+        LOG.info(f"FFmpeg version: {_CAPS['ffmpeg_version'] or 'unknown'}")
         LOG.info("FFmpeg: available")
     else:
-        LOG.critical("FFmpeg: NOT FOUND — encoding will not work")
+        LOG.critical("FFmpeg: NOT FOUND or NOT EXECUTABLE — encoding will not work")
         return _CAPS
 
     # ── ffprobe binary ──
-    try:
-        r = subprocess.run(["ffprobe", "-version"],
-                           capture_output=True, text=True, timeout=15)
-        _CAPS["ffprobe"] = (r.returncode == 0)
-    except Exception:
+    if ffprobe_path:
+        try:
+            r = subprocess.run([ffprobe_path, "-version"],
+                               capture_output=True, text=True, timeout=15)
+            _CAPS["ffprobe"] = (r.returncode == 0)
+            if r.returncode != 0:
+                LOG.error(
+                    f"FFprobe version check failed with return code {r.returncode}.\n"
+                    f"stdout: {r.stdout.strip()[-1000:]}\n"
+                    f"stderr: {r.stderr.strip()[-1000:]}"
+                )
+        except Exception as e:
+            LOG.error(f"FFprobe version check raised an exception: {e}")
+            _CAPS["ffprobe"] = False
+    else:
         _CAPS["ffprobe"] = False
 
     if _CAPS["ffprobe"]:
         LOG.info("FFprobe: available")
     else:
-        LOG.warning("FFprobe: NOT FOUND — stream probing and output validation will be skipped")
+        LOG.warning("FFprobe: NOT FOUND or NOT EXECUTABLE — stream probing and output validation will be skipped")
 
     # ── libx264 encoder ──
     try:
-        r = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+        r = subprocess.run([_ffmpeg_bin(), "-hide_banner", "-encoders"],
                            capture_output=True, text=True, timeout=15)
         _CAPS["libx264"] = ("libx264" in r.stdout)
     except Exception:
@@ -127,7 +208,7 @@ def check_ffmpeg_capabilities() -> dict:
 
     # ── drawtext filter ──
     try:
-        r = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+        r = subprocess.run([_ffmpeg_bin(), "-hide_banner", "-filters"],
                            capture_output=True, text=True, timeout=15)
         _CAPS["drawtext"] = ("drawtext" in r.stdout)
     except Exception:
@@ -188,7 +269,7 @@ def _pil_add_watermark(video_path: str, text: str) -> str | None:
     # ── Probe the input so we know dimensions, fps, pixel format ──
     try:
         probe = subprocess.run(
-            ["ffprobe", "-v", "error",
+            [_ffprobe_bin(), "-v", "error",
              "-select_streams", "v:0",
              "-show_entries", "stream=width,height,r_frame_rate,pix_fmt",
              "-of", "csv=p=0",
@@ -261,13 +342,13 @@ def _pil_add_watermark(video_path: str, text: str) -> str | None:
     frame_size = width * height * 3  # RGB24
 
     decode_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        _ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
         "-i", video_path,
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "pipe:1",
     ]
     encode_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        _ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{width}x{height}",
         "-r", fps_raw,
@@ -352,6 +433,65 @@ def validate_input_file(file_path: str) -> tuple:
     return True, "ok"
 
 
+def probe_file_diagnostics(file_path: str) -> dict:
+    """Run a diagnostic-grade FFprobe pass over a downloaded/input file and
+    return everything needed to explain *why* stream detection did or didn't
+    find a video track -- this is deliberately separate from the lighter
+    weight probe used to actually build the FFmpeg command, so a failure here
+    always has full stdout/stderr to log, never just a boolean.
+
+    Returns a dict:
+        {
+            "ran": bool,          # False only if ffprobe itself couldn't be launched
+            "returncode": int | None,
+            "stdout": str,        # raw ffprobe stdout (JSON text)
+            "stderr": str,        # raw ffprobe stderr
+            "video_streams": int,
+            "audio_streams": int,
+            "subtitle_streams": int,
+            "format_name": str,
+            "duration": str,
+        }
+    """
+    info = {
+        "ran": False, "returncode": None, "stdout": "", "stderr": "",
+        "video_streams": 0, "audio_streams": 0, "subtitle_streams": 0,
+        "format_name": "", "duration": "",
+    }
+    try:
+        result = subprocess.run(
+            [
+                _ffprobe_bin(), "-v", "error",
+                "-show_entries", "stream=index,codec_type,codec_name,width,height",
+                "-show_entries", "format=format_name,duration",
+                "-of", "json",
+                file_path,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        info["ran"] = True
+        info["returncode"] = result.returncode
+        info["stdout"] = result.stdout
+        info["stderr"] = result.stderr
+
+        if result.stdout:
+            try:
+                data = json.loads(result.stdout)
+                streams = data.get("streams", [])
+                info["video_streams"] = sum(1 for s in streams if s.get("codec_type") == "video")
+                info["audio_streams"] = sum(1 for s in streams if s.get("codec_type") == "audio")
+                info["subtitle_streams"] = sum(1 for s in streams if s.get("codec_type") == "subtitle")
+                fmt = data.get("format", {})
+                info["format_name"] = fmt.get("format_name", "")
+                info["duration"] = fmt.get("duration", "")
+            except json.JSONDecodeError as e:
+                LOG.warning(f"probe_file_diagnostics: could not parse ffprobe JSON output: {e}")
+    except Exception as e:
+        info["stderr"] = str(e)
+        LOG.warning(f"probe_file_diagnostics: ffprobe could not be run: {e}")
+    return info
+
+
 def validate_output_file(output_path: str) -> tuple:
     """Confirm ffmpeg actually produced a usable output file, even if it exited 0.
 
@@ -372,7 +512,7 @@ def validate_output_file(output_path: str) -> tuple:
     try:
         result = subprocess.run(
             [
-                "ffprobe", "-v", "error",
+                _ffprobe_bin(), "-v", "error",
                 "-select_streams", "v:0",
                 "-show_entries", "stream=codec_type",
                 "-of", "csv=p=0",
@@ -396,7 +536,7 @@ def get_total_frames(file_path: str) -> int:
     try:
         result = subprocess.run(
             [
-                "ffprobe",
+                _ffprobe_bin(),
                 "-v", "error",
                 "-select_streams", "v:0",
                 "-count_packets",
@@ -418,7 +558,7 @@ def get_total_frames(file_path: str) -> int:
     try:
         result = subprocess.run(
             [
-                "ffprobe",
+                _ffprobe_bin(),
                 "-v", "error",
                 "-select_streams", "v:0",
                 "-show_entries", "stream=duration,r_frame_rate",
@@ -608,7 +748,7 @@ async def generate_sample(input_path: str, duration: int = 30, start_at: str = "
 
     output = input_path.rsplit(".", 1)[0] + "_sample.mp4"
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        _ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
         "-ss", str(start_at),
         "-i", input_path,
         "-t", str(duration),
@@ -635,7 +775,7 @@ def get_video_duration(file_path: str) -> float:
     """Get video duration in seconds using ffprobe."""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [_ffprobe_bin(), "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", file_path],
             capture_output=True, text=True, timeout=30,
         )
