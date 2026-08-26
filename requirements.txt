@@ -1,0 +1,5 @@
+telethon>=1.36.0
+cryptg
+motor>=3.3.0
+pymediainfo
+dnspython
