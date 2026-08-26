@@ -23,6 +23,7 @@ from Bot.utils.decorators import build_ffmpeg_cmd, FFmpegBuildError
 from Bot.utils.ffmpeg import (
     ffmpeg_progress, humanbytes, get_video_duration,
     validate_input_file, validate_output_file,
+    _pil_add_watermark,
 )
 from Bot.utils.progress_pyro import progress_callback
 
@@ -225,6 +226,31 @@ async def _encode_video(event, trim_start: str = "", trim_end: str = ""):
             LOG.error(f"[encode:{user_id}] Output validation failed: {reason}")
             await status_msg.edit(f"**Encoding failed.** {reason}")
             return
+
+        # ── PIL watermark fallback (when drawtext is unavailable) ──────────
+        if diagnostics.get("pil_watermark_needed") and diagnostics.get("pil_watermark_text"):
+            await status_msg.edit("**Applying watermark...**")
+            wm_text = diagnostics["pil_watermark_text"]
+            wm_path = await asyncio.get_event_loop().run_in_executor(
+                None, _pil_add_watermark, output_path, wm_text
+            )
+            if wm_path and os.path.exists(wm_path):
+                # Swap: remove the unwatermarked encode, rename the watermarked one
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+                os.rename(wm_path, output_path)
+                LOG.info(f"[encode:{user_id}] PIL watermark applied successfully.")
+            else:
+                # Watermark step failed, but the base encode is fine — warn and continue
+                LOG.warning(
+                    f"[encode:{user_id}] PIL watermark fallback failed; "                    f"uploading unwatermarked encode."                )
+                try:
+                    if wm_path and os.path.exists(wm_path):
+                        os.remove(wm_path)
+                except Exception:
+                    pass
 
         # Get resolution for caption
         resolution = await check_resolution_settings(user_id) or "480p"

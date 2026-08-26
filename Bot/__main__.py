@@ -4,22 +4,39 @@ import sys
 from telethon import Button
 
 from Bot import bot, ubot, OWNER_ID, LOG, BOT_TOKEN, SESSION_STRING
-from Bot.utils.ffmpeg import check_ffmpeg_installed
+from Bot.utils.ffmpeg import check_ffmpeg_capabilities
 
 
 async def main():
     LOG.info("Starting Erika-Amano Bot...")
 
-    # Verify ffmpeg/ffprobe are actually installed and runnable before we
-    # start accepting encode jobs. This doesn't stop the bot from starting
-    # (other features -- auth, admin, stats -- still work without it), but
-    # it logs a clear, actionable error immediately instead of only
-    # surfacing as an opaque failure on the first user's encode.
-    ffmpeg_ok, ffmpeg_msg = check_ffmpeg_installed()
-    if ffmpeg_ok:
-        LOG.info(ffmpeg_msg)
-    else:
-        LOG.critical(f"FFmpeg check failed: {ffmpeg_msg} Encoding will not work until this is fixed.")
+    # Full capability detection at startup.  This probes drawtext, libx264,
+    # and Pillow availability -- not just "is ffmpeg on PATH" -- so the Heroku
+    # log immediately shows exactly what works and what the fallback strategy
+    # is, without waiting for the first encode to fail.
+    caps = check_ffmpeg_capabilities()
+    if not caps["ffmpeg"]:
+        LOG.critical(
+            "FFmpeg is not available. Encoding will not work. "
+            "Add heroku-buildpack-apt + Aptfile containing 'ffmpeg', "
+            "or set buildpacks in app.json."
+        )
+    if not caps["libx264"]:
+        LOG.warning(
+            "libx264 encoder is unavailable. x264 encoding will fail. "
+            "The installed FFmpeg may be a minimal/stripped build."
+        )
+    if not caps["drawtext"]:
+        if caps["pil_watermark"]:
+            LOG.info(
+                "drawtext unavailable — Pillow watermark fallback is active. "
+                "Watermarks will be applied via frame-pipe post-processing."
+            )
+        else:
+            LOG.warning(
+                "drawtext unavailable AND Pillow not installed. "
+                "Watermarks will be skipped. Install Pillow to restore them."
+            )
 
     # Connect bot
     await bot.start(bot_token=BOT_TOKEN)

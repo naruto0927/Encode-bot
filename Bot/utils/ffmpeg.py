@@ -12,6 +12,15 @@ from Bot import LOG
 # below -- we always *drain* the pipe, we just only *keep* the tail of it.
 _STDERR_TAIL_LIMIT = 4000  # characters
 
+# ── Capability cache (populated at startup by check_ffmpeg_capabilities) ──────
+_CAPS = {
+    "ffmpeg": False,
+    "ffprobe": False,
+    "libx264": False,
+    "drawtext": False,
+    "pil_watermark": False,   # True when Pillow is available as drawtext fallback
+}
+
 
 def time_formatter(milliseconds: int) -> str:
     seconds, milliseconds = divmod(int(milliseconds), 1000)
@@ -43,32 +52,282 @@ def humanbytes(size) -> str:
     return f"{size:.2f} {unit}"
 
 
-def check_ffmpeg_installed() -> tuple:
-    """Verify ffmpeg/ffprobe are on PATH and runnable. Call once at startup.
+# ─────────────────────────────────────────────────────────────────────────────
+# Capability detection
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Returns (ok: bool, message: str).
+def check_ffmpeg_installed() -> tuple:
+    """Backward-compat shim — callers that only want a simple ok/message check.
+
+    For the full capability report (drawtext, libx264, …) call
+    check_ffmpeg_capabilities() instead. This function calls that and returns
+    (ok, summary_message) so existing callers still work.
     """
-    for binary in ("ffmpeg", "ffprobe"):
-        try:
-            result = subprocess.run(
-                [binary, "-version"],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode != 0:
-                return False, (
-                    f"'{binary} -version' exited with code {result.returncode}. "
-                    f"Is {binary} installed correctly?"
-                )
-        except FileNotFoundError:
-            return False, (
-                f"'{binary}' was not found on PATH. Install FFmpeg "
-                f"(e.g. `apt install ffmpeg`) and make sure it's on PATH, "
-                f"or check the Dockerfile if running in a container."
-            )
-        except Exception as e:
-            return False, f"Could not verify '{binary}': {e}"
+    caps = check_ffmpeg_capabilities()
+    if not caps["ffmpeg"] or not caps["ffprobe"]:
+        missing = []
+        if not caps["ffmpeg"]:
+            missing.append("ffmpeg")
+        if not caps["ffprobe"]:
+            missing.append("ffprobe")
+        return False, f"Required binaries not found: {', '.join(missing)}"
     return True, "ffmpeg and ffprobe are available."
 
+
+def check_ffmpeg_capabilities() -> dict:
+    """Probe FFmpeg at startup and populate the global _CAPS dict.
+
+    Returns the same dict so callers can read it immediately.
+
+    Logs one clear line per capability so the Heroku log makes it obvious
+    exactly what works and what doesn't, without having to grep through
+    filter/encoder lists manually.
+    """
+    global _CAPS
+
+    # ── ffmpeg binary ──
+    try:
+        r = subprocess.run(["ffmpeg", "-version"],
+                           capture_output=True, text=True, timeout=15)
+        _CAPS["ffmpeg"] = (r.returncode == 0)
+    except Exception:
+        _CAPS["ffmpeg"] = False
+
+    if _CAPS["ffmpeg"]:
+        LOG.info("FFmpeg: available")
+    else:
+        LOG.critical("FFmpeg: NOT FOUND — encoding will not work")
+        return _CAPS
+
+    # ── ffprobe binary ──
+    try:
+        r = subprocess.run(["ffprobe", "-version"],
+                           capture_output=True, text=True, timeout=15)
+        _CAPS["ffprobe"] = (r.returncode == 0)
+    except Exception:
+        _CAPS["ffprobe"] = False
+
+    if _CAPS["ffprobe"]:
+        LOG.info("FFprobe: available")
+    else:
+        LOG.warning("FFprobe: NOT FOUND — stream probing and output validation will be skipped")
+
+    # ── libx264 encoder ──
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                           capture_output=True, text=True, timeout=15)
+        _CAPS["libx264"] = ("libx264" in r.stdout)
+    except Exception:
+        _CAPS["libx264"] = False
+
+    if _CAPS["libx264"]:
+        LOG.info("libx264: available")
+    else:
+        LOG.warning("libx264: UNAVAILABLE — x264 encoding will fail; check FFmpeg build")
+
+    # ── drawtext filter ──
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                           capture_output=True, text=True, timeout=15)
+        _CAPS["drawtext"] = ("drawtext" in r.stdout)
+    except Exception:
+        _CAPS["drawtext"] = False
+
+    if _CAPS["drawtext"]:
+        LOG.info("drawtext filter: available")
+    else:
+        LOG.warning(
+            "WARNING: FFmpeg drawtext filter is unavailable; "
+            "using configured watermark fallback."
+        )
+
+    # ── Pillow fallback for watermark ──
+    if not _CAPS["drawtext"]:
+        try:
+            from PIL import Image, ImageDraw, ImageFont  # noqa: F401
+            _CAPS["pil_watermark"] = True
+            LOG.info("Pillow watermark fallback: available (will burn text onto frames via post-processing)")
+        except ImportError:
+            _CAPS["pil_watermark"] = False
+            LOG.warning(
+                "Pillow is not installed — watermark fallback also unavailable. "
+                "Install Pillow (`pip install Pillow`) to restore watermarks on this host."
+            )
+
+    return _CAPS
+
+
+def get_ffmpeg_caps() -> dict:
+    """Return the cached capability dict. Safe to call after startup."""
+    return _CAPS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PIL watermark fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pil_add_watermark(video_path: str, text: str) -> str | None:
+    """Burn a text watermark onto every frame of *video_path* using Pillow +
+    FFmpeg's rawvideo pipe (decode → draw → re-mux).
+
+    This is the fallback path used when the FFmpeg build lacks drawtext.
+    It is notably slower than drawtext (raw frame pipe round-trip), but
+    produces a visually identical result.
+
+    Returns the path to the watermarked video on success, or None on failure.
+    The caller is responsible for cleaning up the returned file.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        LOG.error("PIL watermark fallback requested but Pillow is not installed.")
+        return None
+
+    import tempfile, shutil
+
+    # ── Probe the input so we know dimensions, fps, pixel format ──
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate,pix_fmt",
+             "-of", "csv=p=0",
+             video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        parts = probe.stdout.strip().split(",")
+        if len(parts) < 4:
+            LOG.error(f"PIL watermark: ffprobe parse failed: {probe.stdout!r}")
+            return None
+        width, height = int(parts[0]), int(parts[1])
+        fps_raw = parts[2]   # e.g. "24000/1001"
+        pix_fmt = parts[3]   # e.g. "yuv420p"
+    except Exception as e:
+        LOG.error(f"PIL watermark: probe failed: {e}")
+        return None
+
+    # ── Choose a font size relative to the video height ──
+    font_size = max(16, height // 30)
+
+    # Try to load a TTF; fall back gracefully to the PIL default bitmap font.
+    font = None
+    for candidate in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",  # macOS (dev machines)
+    ]:
+        if os.path.exists(candidate):
+            try:
+                font = ImageFont.truetype(candidate, font_size)
+                break
+            except Exception:
+                continue
+
+    if font is None:
+        # PIL's built-in bitmap font — always available, smaller/fixed size
+        font = ImageFont.load_default()
+
+    # ── Pre-render a watermark RGBA image (transparent background) ──
+    # Measure text size with a scratch image
+    scratch = Image.new("RGBA", (1, 1))
+    draw_scratch = ImageDraw.Draw(scratch)
+    try:
+        bbox = draw_scratch.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+    except AttributeError:
+        # Older Pillow (< 8.0) — use textsize
+        tw, th = draw_scratch.textsize(text, font=font)
+
+    margin = 10
+    wm_img = Image.new("RGBA", (tw + margin * 2, th + margin * 2), (0, 0, 0, 0))
+    wm_draw = ImageDraw.Draw(wm_img)
+    # Shadow/border
+    for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+        wm_draw.text((margin + dx, margin + dy), text, font=font, fill=(0, 0, 0, 100))
+    # Main text (50 % alpha white)
+    wm_draw.text((margin, margin), text, font=font, fill=(255, 255, 255, 128))
+
+    wm_w, wm_h = wm_img.size
+    x_pos = width - wm_w - 10
+    y_pos = height - wm_h - 10
+
+    out_path = video_path.rsplit(".", 1)[0] + "_wm." + (video_path.rsplit(".", 1)[1] if "." in video_path else "mkv")
+
+    LOG.info(f"PIL watermark fallback: stamping '{text}' onto {os.path.basename(video_path)}")
+
+    # ── Decode raw RGB frames from FFmpeg ──
+    frame_size = width * height * 3  # RGB24
+
+    decode_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", video_path,
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "pipe:1",
+    ]
+    encode_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}",
+        "-r", fps_raw,
+        "-i", "pipe:0",
+        # Copy audio from original
+        "-i", video_path,
+        "-map", "0:v",
+        "-map", "1:a?",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "copy",
+        "-shortest",
+        out_path,
+    ]
+
+    try:
+        dec_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        enc_proc = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        while True:
+            raw = dec_proc.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            frame = Image.frombytes("RGB", (width, height), raw)
+            frame_rgba = frame.convert("RGBA")
+            frame_rgba.paste(wm_img, (x_pos, y_pos), wm_img)
+            enc_proc.stdin.write(frame_rgba.convert("RGB").tobytes())
+
+        enc_proc.stdin.close()
+        dec_proc.stdout.close()
+
+        _, enc_stderr = enc_proc.communicate(timeout=300)
+        dec_proc.wait(timeout=60)
+
+        if enc_proc.returncode != 0:
+            LOG.error(
+                f"PIL watermark encode failed (code {enc_proc.returncode}): "
+                f"{enc_stderr.decode(errors='replace')[-1000:]}"
+            )
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            return None
+
+        LOG.info(f"PIL watermark fallback: done → {os.path.basename(out_path)}")
+        return out_path
+
+    except Exception as e:
+        LOG.error(f"PIL watermark fallback error: {e}")
+        for p in (dec_proc, enc_proc):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input / output validation
+# ─────────────────────────────────────────────────────────────────────────────
 
 def validate_input_file(file_path: str) -> tuple:
     """Confirm the downloaded/input file exists, is a real file, and is not empty.
@@ -86,7 +345,10 @@ def validate_input_file(file_path: str) -> tuple:
     except OSError as e:
         return False, f"Could not stat input file: {e}"
     if size == 0:
-        return False, f"Input file is empty (0 bytes) -- likely an incomplete download: {os.path.basename(file_path)}"
+        return False, (
+            f"Input file is empty (0 bytes) -- likely an incomplete download: "
+            f"{os.path.basename(file_path)}"
+        )
     return True, "ok"
 
 
@@ -104,6 +366,9 @@ def validate_output_file(output_path: str) -> tuple:
         return False, f"Could not stat output file: {e}"
     if size == 0:
         return False, "Output file is empty (0 bytes)."
+    # Minimum sanity: anything under 10 KB is almost certainly a broken mux
+    if size < 10_240:
+        return False, f"Output file is suspiciously small ({size} bytes) — likely a failed encode."
     try:
         result = subprocess.run(
             [
@@ -121,6 +386,10 @@ def validate_output_file(output_path: str) -> tuple:
         return False, f"Could not verify output with ffprobe: {e}"
     return True, "ok"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Frame / duration helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_total_frames(file_path: str) -> int:
     """Get total frames using ffprobe."""
@@ -198,6 +467,10 @@ async def _drain_stream(stream, tail_holder: list):
     finally:
         tail_holder[0] = "".join(buf)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main FFmpeg runner
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def ffmpeg_progress(cmd, file_path: str, progress_file: str, start_time: float,
                            status_msg, ps_name: str, proc_holder: dict = None):
@@ -321,6 +594,10 @@ async def ffmpeg_progress(cmd, file_path: str, progress_file: str, start_time: f
 
     return returncode, tail
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Misc helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_sample(input_path: str, duration: int = 30, start_at: str = "00:00:30"):
     """Generate a short sample clip from a video. Returns output path or None."""

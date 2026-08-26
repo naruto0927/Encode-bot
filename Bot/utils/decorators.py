@@ -11,7 +11,7 @@ from Bot.plugins.database.mongo_db import (
     check_audio_type_mdb,
     get_user_field,
 )
-from Bot.utils.ffmpeg import validate_input_file
+from Bot.utils.ffmpeg import validate_input_file, get_ffmpeg_caps
 
 # Resolution to FFmpeg scale map
 RESOLUTION_MAP = {
@@ -82,8 +82,6 @@ def _nvenc_usable() -> bool:
     except Exception:
         return False
     # A listed encoder still fails at runtime with no GPU/driver present.
-    # Cheapest real signal without doing a full encode: an NVIDIA device node
-    # or nvidia-smi being present.
     if os.path.exists("/dev/nvidia0"):
         return True
     try:
@@ -227,8 +225,17 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
     unavailable hardware acceleration explicitly requested, no video stream
     found) so the caller can surface a precise reason without ever invoking
     FFmpeg and getting back an opaque failure.
+
+    Watermark strategy
+    ------------------
+    - If drawtext is available → embed via -vf filtergraph (fast, zero-copy).
+    - If drawtext is unavailable AND Pillow is available → set
+      diagnostics["pil_watermark_needed"] = True so the caller can invoke the
+      PIL post-processing step after the base encode succeeds.
+    - If neither is available → skip watermark and log a warning.
     """
     warnings = []
+    caps = get_ffmpeg_caps()
 
     # ── 1. Validate input exists and is non-empty before touching it ──
     ok, reason = validate_input_file(input_path)
@@ -262,8 +269,6 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
     else:
         ok, reason = check_hwaccel_available(user_hw)
         if not ok:
-            # User explicitly asked for hw accel we can't provide -- fail
-            # fast with a clear reason instead of a mysterious ffmpeg crash.
             raise FFmpegBuildError(reason)
         hw = user_hw
 
@@ -292,13 +297,31 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
         else:
             vf_parts.append(f"scale={resolution}")
 
+    # Watermark: use drawtext if the FFmpeg build supports it; otherwise defer
+    # to PIL post-processing (tracked via diagnostics["pil_watermark_needed"]).
     watermark_text = await get_user_field(user_id, "watermark_text", "")
+    pil_watermark_needed = False
+
     if watermark_text:
-        safe_text = _escape_drawtext(watermark_text)
-        vf_parts.append(
-            f"drawtext=text='{safe_text}':fontsize=18:fontcolor=white@0.5"
-            f":x=w-tw-10:y=h-th-10:borderw=1:bordercolor=black@0.3"
-        )
+        if caps.get("drawtext"):
+            safe_text = _escape_drawtext(watermark_text)
+            vf_parts.append(
+                f"drawtext=text='{safe_text}':fontsize=18:fontcolor=white@0.5"
+                f":x=w-tw-10:y=h-th-10:borderw=1:bordercolor=black@0.3"
+            )
+        elif caps.get("pil_watermark"):
+            # PIL fallback: base encode runs without watermark filter, then
+            # encoder.py applies the watermark via frame-pipe post-processing.
+            pil_watermark_needed = True
+            warnings.append(
+                "drawtext filter is not available in this FFmpeg build. "
+                "Watermark will be applied via Pillow post-processing (slower but correct)."
+            )
+        else:
+            warnings.append(
+                "drawtext filter is unavailable AND Pillow is not installed. "
+                "Watermark will be skipped for this encode."
+            )
 
     watermark_image = await get_user_field(user_id, "watermark_image", "")
     use_image_overlay = bool(watermark_image and not watermark_text and os.path.exists(watermark_image))
@@ -339,8 +362,6 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
                     f"file (only {len(streams['audio_streams'])} audio stream(s) found) -- skipped."
                 )
             if not valid:
-                # Nothing usable from the selection -- fall back to default
-                # mapping instead of building a command with zero mapped audio.
                 audio_args = ["-c:a", audio_type, "-b:a", audio_bitrate, "-map", "0:a"]
             else:
                 audio_args = ["-c:a", audio_type, "-b:a", audio_bitrate]
@@ -352,8 +373,7 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
         audio_args = ["-an"]
 
     # ── 8. Subtitles: validate indices, and pick a codec the OUTPUT
-    #        container can actually hold (this is a common real cause of
-    #        "FFmpeg returned an error" -- e.g. copying ASS subs into MP4) ──
+    #        container can actually hold ──
     sub_streams = streams["subtitle_streams"]
     available_sub_indices = {i for i, _ in enumerate(sub_streams)}
     sub_args = []
@@ -372,8 +392,6 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
         else:
             selected = [str(i) for i in range(len(sub_streams))]
 
-        # Drop subtitle codecs that can't be represented in the target
-        # container instead of letting ffmpeg hard-fail on the whole job.
         keepable = []
         for t in selected:
             codec = sub_streams[int(t)]["codec"]
@@ -391,11 +409,7 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
             for t in keepable:
                 sub_args += ["-map", f"0:s:{t}"]
 
-    # ── 9. Assemble the filter graph / overlay, fixing the old bug where
-    #        an image-watermark filter_complex output was built but then
-    #        never actually mapped (plain "-map 0:v" mapped the RAW stream
-    #        instead of the filtered one, so the watermark silently had no
-    #        effect, or ffmpeg complained about an unused filtergraph). ──
+    # ── 9. Assemble the filter graph / overlay ──
     video_map_args = []
     filter_args = []
 
@@ -409,10 +423,7 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
     else:
         video_map_args = ["-map", "0:v"]
 
-    # ── 10. Assemble the full argument list. NOTE: this is a list, executed
-    #         via create_subprocess_exec (no shell), so spaces/unicode/quote
-    #         characters in paths or watermark text can never break parsing
-    #         or be used for shell injection. ──
+    # ── 10. Assemble the full argument list ──
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
     cmd += hw_input_args
     cmd += trim_args
@@ -439,6 +450,14 @@ async def build_ffmpeg_cmd(user_id: int, input_path: str, progress_file: str,
         "video_streams": len(streams["video_streams"]),
         "audio_streams": len(streams["audio_streams"]),
         "subtitle_streams": len(sub_streams),
+        "watermark_mode": (
+            "drawtext" if (watermark_text and caps.get("drawtext")) else
+            "pil_fallback" if pil_watermark_needed else
+            "image_overlay" if use_image_overlay else
+            "none"
+        ),
+        "pil_watermark_needed": pil_watermark_needed,
+        "pil_watermark_text": watermark_text if pil_watermark_needed else "",
     }
 
     return cmd, output_path, diagnostics, warnings
