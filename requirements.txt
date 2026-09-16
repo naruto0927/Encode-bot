@@ -1,4 +1,4 @@
-telethon>=1.36.0
+telethon>=1.45.0
 cryptg
 motor>=3.3.0
 pymediainfo
