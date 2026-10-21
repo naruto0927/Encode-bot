@@ -3,4 +3,4 @@ cryptg
 motor>=3.3.0
 pymediainfo
 dnspython
-Pillow>=10.0.0
+Pillow>=13.0.0
